@@ -1,2 +1,3 @@
-# Thesis
-Thesis code for "Using CNN to paint Gray Image"
+# Thesis-Private-
+
+Thesis here
