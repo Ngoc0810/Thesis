@@ -4,7 +4,7 @@ import tensorflow as tf
 
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras import backend as K
-from tensorflow.keras.layers import Conv2D,MaxPooling2D,UpSampling2D,Input,BatchNormalization,LeakyReLU,Concatenate,Resizing
+from tensorflow.keras.layers import Conv2D,MaxPooling2D,UpSampling2D,Input,BatchNormalization,Concatenate,Resizing,LeakyReLU
 from tensorflow.keras.layers import Conv2DTranspose as Deconvolution
 from tensorflow.keras.models import Model
 from tensorflow.python.ops import math_ops
@@ -13,38 +13,29 @@ import matplotlib.pyplot as plt
 from utils import read_image
 from consts import *
 
-class PaperModel():
+class PaperLabModel():
     # https://www.cambridge.org/core/journals/apsipa-transactions-on-signal-and-information-processing/article/twostage-pyramidal-convolutional-neural-networks-for-image-colorization/07436C294A15C1CB9A694E42CB51C99D
-    def modified_MAE(y_true, y_pred):
-        # h_loss = abs(h_true - h_pred) if abs(h_true - h_pred) <= 1
-        # h_loss = 2 - abs(h_true - h_pred)  if abs(h_true - h_pred) > 1
-        # -> h_loss = min (abs(h_true - h_pred), 2 - abs(h_true - h_pred))
-        # s_loss = abs(s_true - s_pred)
-        diff = math_ops.abs(math_ops.subtract(y_true, y_pred))
-        s_channel = diff[:, :, :, 1]
-        h_channel = diff[:, :, :, 0]
-        h_inverted = math_ops.subtract(tf.constant([2.0]), h_channel)
-        h_correct = math_ops.minimum(h_channel, h_inverted)
-        return h_correct + s_channel
+    # instead of using hsv, we use lab for ease of computation
     
     def __init__(self, image):
         self.data_point_cache = dict()
-        self.LEARNING_RATE = 0.001
+        self.LEARNING_RATE = 0.0001
         self.CHECKPOINT_PATH_LSRN = f"output/{self.name()}/lsrn/cp-{{epoch:06d}}.ckpt"        
         self.CHECKPOINT_PATH_COLOR = f"output/{self.name()}/color/cp-{{epoch:06d}}.ckpt"        
         # if epoch < LSRN_EPOCH_COUNT then trains only LSRN
-        self.LSRN_EPOCH_COUNT = 1
+        self.LSRN_EPOCH_COUNT = 0
         # otherwise train and finetune
-        self.COLOR_EPOCH_COUNT = 1
+        self.COLOR_EPOCH_COUNT = 0
         self.MODE = 'lsrn'
+        self.MODE = 'color'
         assert self.MODE == 'lsrn' or self.MODE == 'color'
 
         # STEP_PER_EPOCH should be set to the amount of data point total
         self.STEP_PER_EPOCH = 100
         # VALIDATION_STEP_PER_EPOCH should be set to the amount of data point in the validation set
-        self.VALIDATION_STEP_PER_EPOCH = 20
+        self.VALIDATION_STEP_PER_EPOCH = 100
         # BATCH_SIZE should be set to a divisor of STEP_PER_EPOCH, although it's not too important if batch size is small enough
-        self.BATCH_SIZE = 25
+        self.BATCH_SIZE = 100
         
         self.EPOCH_PER_CHECKPOINT = 20
         self.instantiate_model(image)
@@ -78,7 +69,7 @@ class PaperModel():
         if latest_color is not None:
             self.checkpoint_color.restore(latest_color)
             color_epoch = int(latest_color[-11:-5])
-        
+        print("Load checkpoints: ", lsrn_epoch, color_epoch)
         self.initial_epoch = color_epoch
         print(f'Loading checkpoint {lsrn_epoch} for lsrn, checkpoint {color_epoch} for color')
         if lsrn_epoch < color_epoch: # need to load the color model on top of lsrn
@@ -94,7 +85,7 @@ class PaperModel():
             raise Exception("Error: equal values of lsrn and color epoch")
 
     def name(self):
-        return 'paper'
+        return 'paper_lab'
         
     # return v channel and hs channels
     def load_datapoint(self, file):
@@ -106,21 +97,20 @@ class PaperModel():
         if image is None:
             self.data_point_cache[file] = (None, None, None)
             return (None, None, None)
-        def get_v_hs(rgb_image):
-            hsv = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV).astype(np.float32)
-            v_channel = hsv[:, :, 2]
-            v_channel = (v_channel - 127.5) / 127.5 # [0, 255] -> [-1, 1]
-            h_channel = hsv[:, :, 0]
-            h_channel = (h_channel - 89.5) / 89.5  # [0, 179] -> [-1, 1]
-            s_channel = hsv[:, :, 1]
-            s_channel = (s_channel - 127.5) / 127.5 # [0, 255] -> [-1, 1]
-            return v_channel, np.stack([h_channel, s_channel], axis=2)
+        def get_l_ab(rgb_image):
+            # https://docs.opencv.org/3.4/de/d25/imgproc_color_conversions.html
+            lab = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2Lab).astype(np.float32)
+            l_channel = lab[:, :, 0]
+            ab_channels = lab[:, :, 1:] #  ab channels
+            l_channel = l_channel / 255 # scale from [0, 255] to [0, 1]
+            ab_channels = (ab_channels - 128) / 127 # scale from [1, 255] to [-1, 1]
+            return l_channel, ab_channels
 
-        v_channel, hs_channels = get_v_hs(image)
+        l_channel, ab_channels = get_l_ab(image)
         image_scaled = cv2.resize(image, (HEIGHT//4, WIDTH//4))
-        _, low_resolution_hs_channels = get_v_hs(image_scaled)
-        self.data_point_cache[file] = (v_channel, hs_channels, low_resolution_hs_channels)
-        return (v_channel, hs_channels, low_resolution_hs_channels)
+        _, low_resolution_ab_channels = get_l_ab(image_scaled)
+        self.data_point_cache[file] = (l_channel, ab_channels, low_resolution_ab_channels)
+        return (l_channel, ab_channels, low_resolution_ab_channels)
 
     def instantiate_model(self, image):
         self.LSRN = Conv2D(64, (3, 3), padding='same', strides=1, activation='relu', name = 'lsrn_conv_0')(image)
@@ -143,7 +133,7 @@ class PaperModel():
         
         self.model_LSRN = Model(name = 'lsrn', inputs = image, outputs = self.LSRN)
         self.model_LSRN.compile(optimizer = Adam(learning_rate=self.LEARNING_RATE),
-                                    loss = PaperModel.modified_MAE, run_eagerly=True)
+                                    loss = 'MSE', run_eagerly=False)
         self.model_LSRN.summary()
         
         image_quarter = Resizing(HEIGHT//4, WIDTH//4)(image)
@@ -170,7 +160,7 @@ class PaperModel():
         self.RCN = Conv2D(128,(3,3),padding='same',strides=1, activation='relu')(self.RCN)
         self.RCN = Conv2D(128,(3,3),padding='same',strides=1, activation='relu')(self.RCN)
         self.RCN = BatchNormalization()(self.RCN)
-        self.RCN = Conv2D(2,(3,3),padding='same',strides=1, activation='tanh')(self.RCN)
+        self.RCN = Conv2D(2,(3,3),padding='same',strides=1, activation='tanh')(self.RCN)##
 
         
         self.model_color = Model(name = 'paper_colourization', inputs = image, outputs = self.RCN)
@@ -182,7 +172,7 @@ class PaperModel():
         for l in self.model_color.layers:
             print(l.name, l.trainable)
         self.model_color.compile(optimizer = Adam(learning_rate=self.LEARNING_RATE),
-                                    loss = PaperModel.modified_MAE, run_eagerly=False)
+                                    loss = 'MSE', run_eagerly=False)
         self.model_color.summary()
         for k,v in self.model_color._get_trainable_state().items():
             print(k, v)
@@ -248,38 +238,31 @@ class PaperModel():
             return self.get_output_color(file, image)
     
     def get_output_color(self, file, image):
-        v_channel, _, _ = self.load_datapoint(file)
-        v_channel = (v_channel * 127.5) + 127.5
-        predicted_hs = self.model_color.predict(v_channel.reshape(1, HEIGHT, WIDTH, 1))
-        predicted_hs = predicted_hs.reshape(HEIGHT, WIDTH, 2)
-        predicted_h = predicted_hs[:,:,0]
-        predicted_h = predicted_h * 89.5 + 89.5
-        predicted_s = predicted_hs[:,:,1]
-        predicted_s = (predicted_s * 127.5) + 127.5
-        assert (predicted_h <= 179).all() and (predicted_h >= 0).all(), "wrong predicted h"
-        assert (predicted_s <= 255).all() and (predicted_s >= 0).all(), "wrong predicted s"
-        assert (v_channel <= 255).all() and (v_channel >= 0).all(), "wrong v"
-        hsv_image = np.stack([predicted_h, predicted_s, v_channel], axis = 2).astype(np.ubyte)
-        image_predict = cv2.cvtColor(hsv_image, cv2.COLOR_HSV2RGB)
+        l_channel, _, _ = self.load_datapoint(file)
+        l_channel = l_channel * 255
+        predicted_ab = self.model_color.predict(l_channel.reshape(1, HEIGHT, WIDTH, 1))
+        predicted_ab = predicted_ab.reshape(HEIGHT, WIDTH, 2)
+        predicted_ab = predicted_ab * 127 + 128
+        assert (predicted_ab <= 255).all() and (predicted_ab >= 1).all(), "wrong predicted ab"
+        assert (l_channel <= 255).all() and (l_channel >= 0).all(), "wrong l"
+        lab_image = np.stack([l_channel, predicted_ab[:,:,0], predicted_ab[:,:,1]], axis = 2).astype(np.ubyte)
+        image_predict = cv2.cvtColor(lab_image, cv2.COLOR_Lab2RGB)
         return image_predict
 
     def get_output_lsrn(self, file, image):
-        v_channel, _, correct = self.load_datapoint(file)
-        v_channel = v_channel * 127.5 + 127.5
-        lr_predicted_hs = self.model_LSRN.predict(v_channel.reshape(1, HEIGHT, WIDTH, 1))
-        lr_predicted_hs = lr_predicted_hs.reshape(HEIGHT//4, WIDTH//4, 2)
-        lr_predicted_h = lr_predicted_hs[:,:,0]
-        lr_predicted_h = lr_predicted_h * 89.5 + 89.5
-        lr_predicted_s = lr_predicted_hs[:,:,1]
-        lr_predicted_s = lr_predicted_s * 127.5 + 127.5
-        predicted_h = cv2.resize(lr_predicted_h, (HEIGHT, WIDTH))
-        predicted_s = cv2.resize(lr_predicted_s, (HEIGHT, WIDTH))
+        l_channel, _, correct = self.load_datapoint(file)
+        l_channel = l_channel * 255
+        lr_predicted_ab = self.model_LSRN.predict(l_channel.reshape(1, HEIGHT, WIDTH, 1))
+        # lr_predicted_ab = correct
+        lr_predicted_ab = lr_predicted_ab.reshape(HEIGHT//4, WIDTH//4, 2)
+        lr_predicted_ab = lr_predicted_ab * 127 + 128
+        
+        predicted_ab = cv2.resize(lr_predicted_ab, (HEIGHT, WIDTH))
         # return np.stack([predicted_s, predicted_s, predicted_s], axis = 2).astype(np.ubyte)
         
-        assert (predicted_h <= 179).all() and (predicted_h >= 0).all(), "wrong predicted h"
-        assert (predicted_s <= 255).all() and (predicted_s >= 0).all(), "wrong predicted s"
-        assert (v_channel <= 255).all() and (v_channel >= 0).all(), "wrong v"
+        assert (predicted_ab <= 255).all() and (predicted_ab >= 1).all(), "wrong predicted ab"
+        assert (l_channel <= 255).all() and (l_channel >= 0).all(), "wrong l"
         # plt.imshow(predicted_h)
-        hsv_image = np.stack([predicted_h, predicted_s, v_channel], axis = 2).astype(np.ubyte)
-        image_predict = cv2.cvtColor(hsv_image, cv2.COLOR_HSV2RGB)
+        lab_image = np.stack([l_channel, predicted_ab[:,:,0], predicted_ab[:,:,1]], axis = 2).astype(np.ubyte)
+        image_predict = cv2.cvtColor(lab_image, cv2.COLOR_Lab2RGB)
         return image_predict
